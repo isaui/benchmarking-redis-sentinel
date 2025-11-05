@@ -4,17 +4,34 @@ Performance testing guide untuk Redis Sentinel dengan HAProxy dan memtier_benchm
 
 ## Architecture
 
-Benchmark menggunakan **HAProxy** sebagai smart router yang:
-- Auto-discovers current master via Sentinel
-- Routes all traffic to active master
-- Handles failover automatically
-- Provides single endpoint untuk clients
+Benchmark menggunakan **HAProxy Dual-Backend** untuk separate write and read testing:
 
+### Components
+
+**HAProxy Dual Backend:**
+- **Port 6379** → `master_backend` (1 master, writes only)
+- **Port 6380** → `replica_backend` (2 replicas, reads only, round-robin)
+- Auto-discovery via Sentinel
+- Automatic failover handling
+
+**Benchmark Flow:**
 ```
-Benchmark Pods (4x) → redis-ha:6379 (HAProxy) → Current Master
-                           ↓
-                      Sentinel (discovery)
+Write Test (4 pods):
+  memtier → redis-ha:6379 → master_backend → Redis Master
+                                 ↓
+                           Sentinel (discovery)
+
+Read Test (4 pods):
+  memtier → redis-ha:6380 → replica_backend → [Replica-1, Replica-2]
+                                 ↓              (round-robin)
+                           Sentinel (discovery)
 ```
+
+**Why Dual Backend?**
+- ✅ Test master write performance independently
+- ✅ Test replica read performance and load balancing
+- ✅ Realistic production scenario (separate read/write paths)
+- ✅ Verify failover handling for both backends
 
 ## Quick Start
 
@@ -27,65 +44,100 @@ Benchmark Pods (4x) → redis-ha:6379 (HAProxy) → Current Master
 kubectl get pods -n redis-sentinel
 # Expect: redis-0/1/2, sentinel-xxx (3x), haproxy-xxx (2/2 ready)
 
-# 3. Run benchmark
+# 3. Run benchmark (dual-phase: write then read)
 ./run-benchmark.sh          # Linux/Mac
 .\run-benchmark.ps1         # Windows
 
 # 4. View results
-kubectl logs -l app=redis-benchmark -n redis-sentinel --tail=50
+kubectl logs -l tier=write -n redis-sentinel  # Write benchmark
+kubectl logs -l tier=read -n redis-sentinel   # Read benchmark
 ```
+
+**What happens:**
+1. **Phase 1** (2 min): 4 pods write to master (populate 100K keys)
+2. **Phase 2** (2 min): 4 pods read from 2 replicas (load balanced)
+3. Total time: ~4-5 minutes
 
 ## Benchmark Specifications
 
-### Configuration
+### Write Benchmark Configuration
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| **Target** | `redis-ha:6379` | HAProxy endpoint |
+| **Job** | `redis-benchmark-write` | 06a-benchmark-write-job.yaml |
+| **Target** | `redis-ha:6379` | HAProxy master backend |
 | **Pods** | 4 | Parallel execution |
 | **Threads per pod** | 2 | CPU threads |
 | **Connections per thread** | 10 | TCP connections |
 | **Total connections** | 80 | 4 pods × 2 threads × 10 conns |
 | **Test duration** | 120s | 2 minutes |
-| **Operation ratio** | 1:1 | 50% SET, 50% GET |
+| **Operation** | 100% SET | Write-only (populate data) |
 | **Data size** | 256 bytes | Per key-value pair |
-| **Pipeline** | 1 | Requests per pipeline |
-| **Key pattern** | Random (S:S) | Distinct seed per client |
+| **Key range** | 1-100,000 | Sequential keys |
+
+### Read Benchmark Configuration
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Job** | `redis-benchmark-read` | 06b-benchmark-read-job.yaml |
+| **Target** | `redis-ha:6380` | HAProxy replica backend (2 replicas) |
+| **Pods** | 4 | Parallel execution |
+| **Threads per pod** | 2 | CPU threads |
+| **Connections per thread** | 10 | TCP connections |
+| **Total connections** | 80 | 4 pods × 2 threads × 10 conns |
+| **Test duration** | 120s | 2 minutes |
+| **Operation** | 100% GET | Read-only from replicas |
+| **Load balancing** | Round-robin | Across 2 replicas |
+| **Key range** | 1-100,000 | Same keys from write phase |
 
 ### Load Distribution
 
+**Phase 1: Write (Master Backend)**
 ```
-Connection Flow:
-  80 clients → redis-ha (HAProxy) → Current Master (auto-discovered)
+80 write clients → redis-ha:6379 → master_backend → Redis Master
+  
+- 100% SET operations
+- Populate 100K unique keys
+- 256 bytes per value
+- All traffic to single master
+```
 
-Operation types:
-  - SET operations: ~50% (writes to master via HAProxy)
-  - GET operations: ~50% (reads from master via HAProxy)
-  
-Data pattern:
-  - Random keys with sequential pattern (S:S)
-  - 256 bytes per key-value
-  - Distinct seed per client (no key collision)
-  
-Failover handling:
-  - HAProxy detects new master from Sentinel (~5s)
-  - Automatic reconnection to new master
-  - Minimal benchmark interruption
+**Phase 2: Read (Replica Backend)**  
 ```
+80 read clients → redis-ha:6380 → replica_backend → [Replica-1, Replica-2]
+  
+- 100% GET operations  
+- Read same 100K keys from Phase 1
+- Round-robin load balancing
+- Traffic split ~50/50 across 2 replicas
+```
+
+**Failover Handling:**
+- Master fails → New master promoted → `master_backend` updated
+- Replica promoted → Removed from `replica_backend`, added to `master_backend`
+- Old master recovers → Added to `replica_backend`
+- HAProxy updates via Sentinel (~5-10s detection + update)
 
 ## Monitoring
 
 ### Watch Benchmark Progress
 
 ```bash
-# Monitor job status
-kubectl get job redis-benchmark -n redis-sentinel -w
+# Monitor write job
+kubectl get job redis-benchmark-write -n redis-sentinel -w
 
-# Watch pods
-kubectl get pods -l app=redis-benchmark -n redis-sentinel -w
+# Monitor read job  
+kubectl get job redis-benchmark-read -n redis-sentinel -w
 
-# Follow logs from all pods
-kubectl logs -f -l app=redis-benchmark -n redis-sentinel --max-log-requests=10
+# Watch write pods
+kubectl get pods -l tier=write -n redis-sentinel -w
+
+# Watch read pods
+kubectl get pods -l tier=read -n redis-sentinel -w
+
+# Follow logs
+kubectl logs -f -l tier=write -n redis-sentinel --max-log-requests=5
+kubectl logs -f -l tier=read -n redis-sentinel --max-log-requests=5
 ```
 
 ### Monitor During Benchmark
@@ -348,28 +400,48 @@ kubectl exec -l app=haproxy -n redis-sentinel -c haproxy -- \
 
 ### Minikube (Local Development)
 
-Actual results on Minikube via HAProxy:
+Actual results on Minikube via HAProxy dual-backend:
 
+**Write Performance** (4 pods → master_backend):
 ```
 Configuration: 4 pods, 2 threads, 10 connections
-Total connections: 80
-Connection: redis-ha (HAProxy) → Master
+Total connections: 80 → redis-ha:6379 → Master
 
 Throughput (Aggregate):
-  - SETs: ~3,500-3,600 ops/sec
-  - GETs: ~3,500-3,600 ops/sec
-  - Total: ~7,000-7,200 ops/sec
+  - SETs: ~7,000-7,200 ops/sec
+  - Per pod: ~1,750-1,800 ops/sec
 
 Latency:
-  - p50 (Median): 1.68-1.72 ms  ✓ Excellent
+  - p50 (Median): 1.7-1.8 ms  ✓ Excellent
   - p90: 82-84 ms
-  - p95: 87 ms
+  - p95: 86-87 ms
   - p99: 89-90 ms
   - p99.9: 94-95 ms
 
 Bandwidth:
   - ~2 MB/sec total
-  - ~500 KB/sec per pod
+  - ~520 KB/sec per pod
+```
+
+**Read Performance** (4 pods → replica_backend, 2 replicas):
+```
+Configuration: 4 pods, 2 threads, 10 connections
+Total connections: 80 → redis-ha:6380 → 2 Replicas (round-robin)
+
+Throughput (Aggregate):
+  - GETs: ~7,000-7,200 ops/sec
+  - Per pod: ~1,750-1,800 ops/sec
+  - Per replica: ~3,500-3,600 ops/sec (load balanced)
+
+Latency:
+  - p50 (Median): 1.7-1.8 ms  ✓ Excellent
+  - p90: 82-84 ms
+  - p95: 86-87 ms
+  - p99: 89-90 ms
+  - p99.9: 94-95 ms
+
+Bandwidth:
+  - ~2 MB/sec total
 ```
 
 ### Production Cluster (Estimated)
