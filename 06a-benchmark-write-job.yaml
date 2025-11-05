@@ -1,41 +1,40 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: redis-benchmark
+  name: redis-benchmark-write
   namespace: redis-sentinel
 spec:
-  # 4 pods running in parallel
+  # 4 pods for writes
   parallelism: 4
   completions: 4
   backoffLimit: 2
   template:
     metadata:
       labels:
-        app: redis-benchmark
+        app: redis-benchmark-write
+        tier: write
     spec:
       restartPolicy: Never
       containers:
-      - name: memtier
+      - name: memtier-write
         image: redislabs/memtier_benchmark:latest
         command:
         - sh
         - -c
         - |
-          echo "Starting benchmark..."
+          echo "====================================="
+          echo "WRITE Benchmark (Data Population)"
+          echo "====================================="
           echo "Pod: $HOSTNAME"
-          echo "Target: redis-ha.redis-sentinel.svc.cluster.local:6379 (via HAProxy)"
-          echo ""
-          echo "HAProxy provides:"
-          echo "  - Auto-discovery of current master via Sentinel"
-          echo "  - Automatic failover handling"
-          echo "  - Connection routing to active master"
+          echo "Target: redis-ha.redis-sentinel.svc.cluster.local:6379 (Master)"
+          echo "Operation: 100% SET (data population)"
           echo ""
           
-          # Wait for HAProxy to be ready
+          # Wait for HAProxy
           echo "Waiting for HAProxy..."
           sleep 5
           
-          # Run memtier_benchmark via HAProxy
+          # Run memtier_benchmark - WRITE ONLY
           memtier_benchmark \
             --server=redis-ha.redis-sentinel.svc.cluster.local \
             --port=6379 \
@@ -43,21 +42,19 @@ spec:
             --clients=10 \
             --threads=2 \
             --test-time=120 \
-            --ratio=1:1 \
+            --ratio=1:0 \
             --data-size=256 \
-            --key-pattern=S:S \
-            --pipeline=1 \
+            --key-minimum=1 \
+            --key-maximum=100000 \
+            --key-pattern=P:P \
             --randomize \
             --distinct-client-seed \
-            --print-percentiles=50,90,95,99,99.9 \
-            --json-out-file=/tmp/benchmark-result.json
+            --print-percentiles=50,90,95,99,99.9
           
           echo ""
-          echo "Benchmark completed!"
-          echo "Results saved to /tmp/benchmark-result.json"
+          echo "Write benchmark completed!"
+          echo "Data populated: 100K keys on master"
           
-          # Print summary
-          cat /tmp/benchmark-result.json | grep -E '"Totals"|"GET"|"SET"' || true
         resources:
           requests:
             cpu: 500m

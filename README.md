@@ -87,6 +87,18 @@ Deployment script akan otomatis deploy sesuai urutan ini.
 
 ### 1. Deploy ke Kubernetes
 
+**Recommended: Gunakan deployment script (includes HAProxy)**
+
+```bash
+# Linux/Mac
+./deploy.sh apply
+
+# Windows PowerShell
+.\deploy.ps1 -Action apply
+```
+
+**Manual deployment:**
+
 ```bash
 # Deploy semua resources (ordered by prefix)
 kubectl apply -f 00-namespace.yaml
@@ -96,9 +108,10 @@ kubectl apply -f 03-service.yaml
 kubectl apply -f 04-statefulset-redis.yaml
 kubectl apply -f 05-deployment-sentinel.yaml
 
-# Atau gunakan deployment script
-./deploy.sh apply          # Linux/Mac
-.\deploy.ps1 -Action apply # Windows PowerShell
+# Deploy HAProxy (Sentinel-aware router)
+kubectl apply -f 07-haproxy-configmap.yaml
+kubectl apply -f 08-haproxy-deployment.yaml
+kubectl apply -f 09-haproxy-service.yaml
 ```
 
 ### 2. Verifikasi Deployment
@@ -108,13 +121,14 @@ kubectl apply -f 05-deployment-sentinel.yaml
 kubectl get pods -n redis-sentinel
 
 # Expected output:
-# NAME         READY   STATUS    RESTARTS   AGE
-# redis-0      1/1     Running   0          2m
-# redis-1      1/1     Running   0          1m
-# redis-2      1/1     Running   0          1m
-# sentinel-xxx 1/1     Running   0          30s
-# sentinel-yyy 1/1     Running   0          30s
-# sentinel-zzz 1/1     Running   0          30s
+# NAME              READY   STATUS    RESTARTS   AGE
+# haproxy-xxx       2/2     Running   0          1m
+# redis-0           1/1     Running   0          2m
+# redis-1           1/1     Running   0          2m
+# redis-2           1/1     Running   0          2m
+# sentinel-xxx      1/1     Running   0          2m
+# sentinel-yyy      1/1     Running   0          2m
+# sentinel-zzz      1/1     Running   0          2m
 ```
 
 ### 3. Cek Services
@@ -124,18 +138,38 @@ kubectl get svc -n redis-sentinel
 
 # Expected output:
 # NAME               TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)
+# haproxy-stats      ClusterIP   10.x.x.x        <none>        8404/TCP
 # redis              ClusterIP   10.x.x.x        <none>        6379/TCP
+# redis-ha           ClusterIP   10.x.x.x        <none>        6379/TCP,8404/TCP  ← USE THIS!
 # redis-headless     ClusterIP   None            <none>        6379/TCP
 # sentinel           ClusterIP   10.x.x.x        <none>        26379/TCP
 # sentinel-headless  ClusterIP   None            <none>        26379/TCP
 ```
 
+**⚠️ Important:** Aplikasi/clients harus connect ke `redis-ha:6379`, BUKAN `redis` service!
+
 ## Testing
 
-### 1. Cek Redis Replication
+### 1. Test Connection via HAProxy
 
 ```bash
-# Connect ke master
+# Test PING (recommended way)
+kubectl run redis-test --image=redis:7.2-alpine -n redis-sentinel --rm -it --restart=Never -- redis-cli -h redis-ha PING
+# Expected: PONG
+
+# Test SET
+kubectl run redis-test --image=redis:7.2-alpine -n redis-sentinel --rm -it --restart=Never -- redis-cli -h redis-ha SET mykey "Hello Sentinel"
+# Expected: OK
+
+# Test GET
+kubectl run redis-test --image=redis:7.2-alpine -n redis-sentinel --rm -it --restart=Never -- redis-cli -h redis-ha GET mykey
+# Expected: "Hello Sentinel"
+```
+
+### 2. Cek Redis Replication
+
+```bash
+# Connect ke master (direct)
 kubectl exec -it redis-0 -n redis-sentinel -- redis-cli
 
 # Cek role
@@ -144,9 +178,7 @@ kubectl exec -it redis-0 -n redis-sentinel -- redis-cli
 
 # Cek replica
 127.0.0.1:6379> INFO replication
-```
 
-```bash
 # Connect ke replica
 kubectl exec -it redis-1 -n redis-sentinel -- redis-cli
 
@@ -155,7 +187,7 @@ kubectl exec -it redis-1 -n redis-sentinel -- redis-cli
 # Output: slave
 ```
 
-### 2. Cek Sentinel Status
+### 3. Cek Sentinel Status
 
 ```bash
 # Connect ke sentinel
@@ -171,7 +203,20 @@ kubectl exec -it deployment/sentinel -n redis-sentinel -- redis-cli -p 26379
 127.0.0.1:26379> SENTINEL replicas mymaster
 ```
 
-### 3. Test Write/Read
+### 4. HAProxy Monitoring
+
+```bash
+# Port forward HAProxy stats page
+kubectl port-forward svc/haproxy-stats 8404:8404 -n redis-sentinel
+
+# Open browser: http://localhost:8404
+# You'll see:
+# - Current backend server (master IP)
+# - Connection statistics
+# - Health check status
+```
+
+### 5. Test Write/Read via HAProxy
 
 ```bash
 # Write ke master
@@ -326,13 +371,21 @@ kubectl apply -f 02-configmap-sentinel.yaml
 kubectl rollout restart deployment/sentinel -n redis-sentinel
 ```
 
-## Performance Testing dengan Memtier Benchmark
+## 📊 Performance Testing dengan Memtier Benchmark
+
+Setup benchmark menggunakan HAProxy sebagai single endpoint untuk testing Sentinel failover.
 
 ### Benchmark Configuration
 
 Test setup menggunakan `memtier_benchmark` dengan spesifikasi:
 
 ```
+Connection:
+- Target: redis-ha.redis-sentinel.svc.cluster.local:6379 (via HAProxy)
+- HAProxy auto-discovers master via Sentinel
+- Automatic failover handling
+
+Load Configuration:
 - 4 Kubernetes Job pods (parallel execution)
 - 2 threads per pod
 - 10 connections per thread
@@ -340,37 +393,59 @@ Test setup menggunakan `memtier_benchmark` dengan spesifikasi:
 - Test duration: 2 minutes (120 seconds)
 - Operation ratio: 50% SET, 50% GET (1:1)
 - Data size: 256 bytes per key
-- Key pattern: Sequential
+- Key pattern: Random with distinct seeds
 ```
 
 ### Running Benchmark
 
+**Option 1: Automated Script (Recommended)**
+
 ```bash
-# Pastikan Redis Sentinel sudah running
+# Linux/Mac
+./run-benchmark.sh
+
+# Windows PowerShell
+.\run-benchmark.ps1
+```
+
+Script akan otomatis:
+- Check Redis cluster readiness
+- Clean up old benchmark jobs
+- Deploy benchmark
+- Monitor progress real-time
+- Collect & display results
+
+**Option 2: Manual**
+
+```bash
+# Pastikan Redis Sentinel & HAProxy sudah running
 kubectl get pods -n redis-sentinel
 
-# Run benchmark dengan script
-./run-benchmark.sh          # Linux/Mac
-.\run-benchmark.ps1         # Windows PowerShell
-
-# Atau manual
+# Deploy benchmark job
 kubectl apply -f 06-benchmark-job.yaml
 
 # Monitor progress
-kubectl get pods -n redis-sentinel -l app=redis-benchmark -w
+kubectl get job redis-benchmark -n redis-sentinel -w
 
-# Lihat logs semua pods
-kubectl logs -l app=redis-benchmark -n redis-sentinel --tail=100
+# Check logs
+kubectl logs -l app=redis-benchmark -n redis-sentinel --tail=50
 ```
 
 ### Expected Results
 
-Benchmark akan menghasilkan metrics:
+Benchmark menghasilkan metrics per pod:
 
-- **Throughput**: Total ops/sec dari semua pods
-- **Latency**: p50, p90, p95, p99, p99.9 percentiles
-- **Hits/Misses**: GET hit rate
-- **Bandwidth**: KB/sec untuk SET dan GET operations
+```
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency
+Sets          ~900          ---          ---          ~11ms            ~1.7ms          ~90ms
+Gets          ~900         ~900           0          ~11ms            ~1.7ms          ~90ms
+Totals       ~1800         ~900           0          ~11ms            ~1.7ms          ~90ms
+```
+
+**Aggregate (4 pods):**
+- Total Throughput: ~7,000 ops/sec
+- SETs: ~3,500 ops/sec
+- GETs: ~3,500 ops/sec
 
 ### Cleanup Benchmark
 
@@ -381,18 +456,21 @@ kubectl delete job redis-benchmark -n redis-sentinel
 # Pods akan otomatis di-cleanup setelah job selesai
 ```
 
-### Benchmark Results Analysis
+### Advanced: Benchmark Results Analysis
 
 ```bash
-# Aggregate results dari semua pods
-for pod in $(kubectl get pods -n redis-sentinel -l app=redis-benchmark -o name); do
-  echo "=== $pod ==="
-  kubectl logs $pod -n redis-sentinel | grep "Totals"
-done
+# View results from all pods
+kubectl get pods -n redis-sentinel -l app=redis-benchmark -o name | \
+  ForEach-Object { 
+    Write-Host "=== $_ ==="
+    kubectl logs $_ -n redis-sentinel | Select-String "^Totals"
+  }
 
-# Export results ke file
+# Export results to file
 kubectl logs -l app=redis-benchmark -n redis-sentinel > benchmark-results.txt
 ```
+
+Untuk analisis detail, lihat [BENCHMARK.md](BENCHMARK.md)
 
 ## Next Steps
 

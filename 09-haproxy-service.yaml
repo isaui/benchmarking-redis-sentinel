@@ -11,7 +11,11 @@ spec:
   - port: 6379
     targetPort: 6379
     protocol: TCP
-    name: redis
+    name: redis-write
+  - port: 6380
+    targetPort: 6380
+    protocol: TCP
+    name: redis-read
   - port: 8404
     targetPort: 8404
     protocol: TCP

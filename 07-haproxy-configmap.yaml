@@ -20,15 +20,21 @@ data:
         timeout server 30s
         timeout check 2s
         
-    # Frontend untuk client connections
-    frontend redis_frontend
+    # Frontend for WRITES (master only)
+    frontend redis_write
         bind *:6379
-        default_backend redis_backend
+        default_backend master_backend
+        
+    # Frontend for READS (replicas only)
+    frontend redis_read
+        bind *:6380
+        default_backend replica_backend
         
     # Backend - Redis master (dynamically updated via Runtime API)
-    backend redis_backend
+    backend master_backend
         mode tcp
         option tcp-check
+        balance roundrobin
         
         # Health check to verify it's master
         tcp-check connect
@@ -40,6 +46,23 @@ data:
         
         # Dynamic server - will be added/updated by sentinel-watcher
         # Initial placeholder
+        
+    # Backend - Redis replicas (dynamically updated via Runtime API)
+    backend replica_backend
+        mode tcp
+        option tcp-check
+        balance roundrobin
+        
+        # Health check to verify it's replica
+        tcp-check connect
+        tcp-check send PING\r\n
+        tcp-check expect string +PONG
+        tcp-check send ROLE\r\n
+        tcp-check expect string slave
+        tcp-check send QUIT\r\n
+        
+        # Dynamic servers - will be added/updated by sentinel-watcher
+        # Initial placeholder (2 replicas expected)
         
     # Admin/Stats page
     frontend stats
@@ -53,7 +76,8 @@ data:
   
   sentinel-watcher.sh: |
     #!/bin/sh
-    # Sentinel watcher - monitors Sentinel and updates HAProxy via Runtime API
+    # Sentinel watcher - monitors Sentinel and updates HAProxy backends
+    # Manages both master_backend (writes) and replica_backend (reads)
     
     SENTINEL_HOST="sentinel.redis-sentinel.svc.cluster.local"
     SENTINEL_PORT="26379"
@@ -61,61 +85,118 @@ data:
     HAPROXY_SOCKET="/var/run/haproxy.sock"
     CHECK_INTERVAL=5
     
-    echo "Starting Sentinel watcher..."
+    echo "Starting Dual-Backend Sentinel watcher..."
     echo "Sentinel: $SENTINEL_HOST:$SENTINEL_PORT"
     echo "Master name: $MASTER_NAME"
+    echo "Backends: master_backend (writes), replica_backend (reads)"
     echo ""
     
     CURRENT_MASTER=""
+    CURRENT_REPLICAS=""
+    
+    # Function to resolve hostname to IP
+    resolve_ip() {
+        local host=$1
+        if echo "$host" | grep -q "\."; then
+            # It's a hostname, resolve to IP
+            local ip=$(getent hosts $host | awk '{ print $1 }' | head -n1)
+            if [ -z "$ip" ]; then
+                # Fallback: use nslookup
+                ip=$(nslookup $host | grep "Address:" | tail -n1 | awk '{print $2}')
+            fi
+            echo "$ip"
+        else
+            # Already an IP
+            echo "$host"
+        fi
+    }
     
     while true; do
-        # Query Sentinel for current master
+        # === QUERY SENTINEL FOR MASTER ===
         MASTER_INFO=$(redis-cli -h $SENTINEL_HOST -p $SENTINEL_PORT \
             SENTINEL get-master-addr-by-name $MASTER_NAME 2>/dev/null)
         
         if [ $? -eq 0 ] && [ -n "$MASTER_INFO" ]; then
             MASTER_HOST=$(echo "$MASTER_INFO" | head -n1)
             MASTER_PORT=$(echo "$MASTER_INFO" | tail -n1)
-            
-            # Resolve hostname to IP if needed
-            if echo "$MASTER_HOST" | grep -q "\."; then
-                # It's a hostname, resolve to IP
-                MASTER_IP=$(getent hosts $MASTER_HOST | awk '{ print $1 }' | head -n1)
-                if [ -z "$MASTER_IP" ]; then
-                    # Fallback: use nslookup
-                    MASTER_IP=$(nslookup $MASTER_HOST | grep "Address:" | tail -n1 | awk '{print $2}')
-                fi
-            else
-                # Already an IP
-                MASTER_IP=$MASTER_HOST
-            fi
-            
+            MASTER_IP=$(resolve_ip "$MASTER_HOST")
             NEW_MASTER="${MASTER_IP}:${MASTER_PORT}"
             
+            # Update master backend if changed
             if [ "$NEW_MASTER" != "$CURRENT_MASTER" ] && [ -n "$MASTER_IP" ]; then
-                echo "[$(date)] Master changed: $CURRENT_MASTER -> $NEW_MASTER (from $MASTER_HOST)"
+                echo "[$(date)] MASTER changed: $CURRENT_MASTER -> $NEW_MASTER"
                 
-                # Remove old server if exists
+                # Remove old master
                 if [ -n "$CURRENT_MASTER" ]; then
-                    echo "set server redis_backend/redis-master state maint" | socat - $HAPROXY_SOCKET
-                    sleep 0.5
-                    echo "del server redis_backend/redis-master" | socat - $HAPROXY_SOCKET
+                    echo "set server master_backend/redis-master state maint" | socat - $HAPROXY_SOCKET
+                    sleep 0.3
+                    echo "del server master_backend/redis-master" | socat - $HAPROXY_SOCKET
                 fi
                 
-                # Add new master with IP
-                echo "add server redis_backend/redis-master $MASTER_IP:$MASTER_PORT check" | socat - $HAPROXY_SOCKET
-                sleep 0.5
-                echo "set server redis_backend/redis-master state ready" | socat - $HAPROXY_SOCKET
-                echo "enable server redis_backend/redis-master" | socat - $HAPROXY_SOCKET
-                
-                # Verify
-                ROLE=$(redis-cli -h $MASTER_IP -p $MASTER_PORT ROLE 2>/dev/null | head -n1)
-                echo "[$(date)] New master $NEW_MASTER verified as: $ROLE"
+                # Add new master
+                echo "add server master_backend/redis-master $MASTER_IP:$MASTER_PORT check" | socat - $HAPROXY_SOCKET
+                sleep 0.3
+                echo "set server master_backend/redis-master state ready" | socat - $HAPROXY_SOCKET
+                echo "enable server master_backend/redis-master" | socat - $HAPROXY_SOCKET
                 
                 CURRENT_MASTER="$NEW_MASTER"
+                echo "[$(date)] ✓ Master backend updated"
             fi
-        else
-            echo "[$(date)] Failed to query Sentinel, retrying..."
+        fi
+        
+        # === QUERY SENTINEL FOR REPLICAS ===
+        REPLICA_DATA=$(redis-cli -h $SENTINEL_HOST -p $SENTINEL_PORT \
+            SENTINEL replicas $MASTER_NAME 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$REPLICA_DATA" ]; then
+            # Parse replica IPs and ports properly
+            # Extract only healthy replicas (not s_down)
+            REPLICA_LIST=$(echo "$REPLICA_DATA" | awk '
+                /^ip$/ { getline; ip=$0 }
+                /^port$/ { getline; port=$0 }
+                /^flags$/ { getline; flags=$0; if (flags !~ /s_down/) print ip":"port }
+            ')
+            
+            # Resolve hostnames to IPs
+            NEW_REPLICAS=""
+            for replica in $REPLICA_LIST; do
+                REPLICA_HOST=$(echo "$replica" | cut -d: -f1)
+                REPLICA_PORT=$(echo "$replica" | cut -d: -f2)
+                REPLICA_IP=$(resolve_ip "$REPLICA_HOST")
+                if [ -n "$REPLICA_IP" ] && [ -n "$REPLICA_PORT" ]; then
+                    NEW_REPLICAS="$NEW_REPLICAS $REPLICA_IP:$REPLICA_PORT"
+                fi
+            done
+            
+            # Update replica backend if changed
+            if [ "$NEW_REPLICAS" != "$CURRENT_REPLICAS" ]; then
+                echo "[$(date)] REPLICAS changed"
+                echo "  Old: $CURRENT_REPLICAS"
+                echo "  New: $NEW_REPLICAS"
+                
+                # Clear all existing replicas
+                echo "disable server replica_backend/replica-1" | socat - $HAPROXY_SOCKET 2>/dev/null || true
+                echo "disable server replica_backend/replica-2" | socat - $HAPROXY_SOCKET 2>/dev/null || true
+                echo "set server replica_backend/replica-1 state maint" | socat - $HAPROXY_SOCKET 2>/dev/null || true
+                echo "set server replica_backend/replica-2 state maint" | socat - $HAPROXY_SOCKET 2>/dev/null || true
+                sleep 0.3
+                echo "del server replica_backend/replica-1" | socat - $HAPROXY_SOCKET 2>/dev/null || true
+                echo "del server replica_backend/replica-2" | socat - $HAPROXY_SOCKET 2>/dev/null || true
+                
+                # Add new replicas
+                IDX=1
+                for replica in $NEW_REPLICAS; do
+                    echo "add server replica_backend/replica-$IDX $replica check" | socat - $HAPROXY_SOCKET
+                    sleep 0.2
+                    echo "set server replica_backend/replica-$IDX state ready" | socat - $HAPROXY_SOCKET
+                    echo "enable server replica_backend/replica-$IDX" | socat - $HAPROXY_SOCKET
+                    echo "[$(date)] ✓ Added replica-$IDX: $replica"
+                    IDX=$((IDX + 1))
+                done
+                
+                CURRENT_REPLICAS="$NEW_REPLICAS"
+                echo "[$(date)] ✓ Replica backend updated"
+            fi
         fi
         
         sleep $CHECK_INTERVAL

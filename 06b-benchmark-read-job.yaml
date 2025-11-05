@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-benchmark-read
+  namespace: redis-sentinel
+spec:
+  # 4 pods for reads
+  parallelism: 4
+  completions: 4
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: redis-benchmark-read
+        tier: read
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: memtier-read
+        image: redislabs/memtier_benchmark:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "====================================="
+          echo "READ Benchmark (Replica Read Test)"
+          echo "====================================="
+          echo "Pod: $HOSTNAME"
+          echo "Target: redis-ha.redis-sentinel.svc.cluster.local:6380 (Replicas)"
+          echo "Operation: 100% GET (read from replicas)"
+          echo ""
+          
+          # Wait for HAProxy + initial data population
+          echo "Waiting for HAProxy and data population..."
+          sleep 10
+          
+          # Run memtier_benchmark - READ ONLY
+          memtier_benchmark \
+            --server=redis-ha.redis-sentinel.svc.cluster.local \
+            --port=6380 \
+            --protocol=redis \
+            --clients=10 \
+            --threads=2 \
+            --test-time=120 \
+            --ratio=0:1 \
+            --data-size=256 \
+            --key-minimum=1 \
+            --key-maximum=100000 \
+            --key-pattern=R:R \
+            --randomize \
+            --distinct-client-seed \
+            --print-percentiles=50,90,95,99,99.9
+          
+          echo ""
+          echo "Read benchmark completed!"
+          echo "Read from replicas via HAProxy"
+          
+        resources:
+          requests:
+            cpu: 500m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi

@@ -29,28 +29,55 @@ spec:
             sleep 2
           done
           
+          # Function to resolve hostname
+          resolve_ip() {
+            host=$1
+            if echo "$host" | grep -q "\."; then
+              ip=$(getent hosts $host | awk '{ print $1 }' | head -n1)
+              [ -z "$ip" ] && ip=$(nslookup $host | grep "Address:" | tail -n1 | awk '{print $2}')
+              echo "$ip"
+            else
+              echo "$host"
+            fi
+          }
+          
           # Get master
           MASTER_INFO=$(redis-cli -h sentinel.redis-sentinel.svc.cluster.local -p 26379 \
             SENTINEL get-master-addr-by-name mymaster)
           
           MASTER_HOST=$(echo "$MASTER_INFO" | head -n1)
           MASTER_PORT=$(echo "$MASTER_INFO" | tail -n1)
-          
-          # Resolve hostname to IP if needed
-          if echo "$MASTER_HOST" | grep -q "\."; then
-            # It's a hostname, resolve to IP
-            MASTER_IP=$(getent hosts $MASTER_HOST | awk '{ print $1 }' | head -n1)
-            if [ -z "$MASTER_IP" ]; then
-              # Fallback: use nslookup
-              MASTER_IP=$(nslookup $MASTER_HOST | grep "Address:" | tail -n1 | awk '{print $2}')
-            fi
-          else
-            # Already an IP
-            MASTER_IP=$MASTER_HOST
-          fi
+          MASTER_IP=$(resolve_ip "$MASTER_HOST")
           
           echo "Master: $MASTER_HOST -> $MASTER_IP:$MASTER_PORT"
           echo "$MASTER_IP:$MASTER_PORT" > /shared/initial-master
+          
+          # Get replicas
+          REPLICA_DATA=$(redis-cli -h sentinel.redis-sentinel.svc.cluster.local -p 26379 \
+            SENTINEL replicas mymaster)
+          
+          # Parse replicas properly (same logic as sentinel-watcher)
+          REPLICA_LIST=$(echo "$REPLICA_DATA" | awk '
+            /^ip$/ { getline; ip=$0 }
+            /^port$/ { getline; port=$0 }
+            /^flags$/ { getline; flags=$0; if (flags !~ /s_down/) print ip":"port }
+          ')
+          
+          echo "Replicas:"
+          SEEN_IPS=""
+          for replica in $REPLICA_LIST; do
+            REPLICA_HOST=$(echo "$replica" | cut -d: -f1)
+            REPLICA_PORT=$(echo "$replica" | cut -d: -f2)
+            REPLICA_IP=$(resolve_ip "$REPLICA_HOST")
+            if [ -n "$REPLICA_IP" ] && [ -n "$REPLICA_PORT" ]; then
+              # Skip if IP already seen (dedup)
+              if ! echo "$SEEN_IPS" | grep -q "$REPLICA_IP"; then
+                echo "  $REPLICA_HOST -> $REPLICA_IP:$REPLICA_PORT"
+                echo "$REPLICA_IP:$REPLICA_PORT" >> /shared/initial-replicas
+                SEEN_IPS="$SEEN_IPS $REPLICA_IP"
+              fi
+            fi
+          done
       
         volumeMounts:
         - name: shared
@@ -62,7 +89,9 @@ spec:
         image: haproxytech/haproxy-alpine:2.8
         ports:
         - containerPort: 6379
-          name: redis
+          name: redis-write
+        - containerPort: 6380
+          name: redis-read
         - containerPort: 8404
           name: stats
         command:
@@ -72,14 +101,19 @@ spec:
           # Install socat for Runtime API
           apk add --no-cache socat redis
           
-          # Wait for initial master discovery
+          # Wait for initial discovery
           while [ ! -f /shared/initial-master ]; do
-            echo "Waiting for initial master..."
+            echo "Waiting for initial topology discovery..."
             sleep 1
           done
           
           INITIAL_MASTER=$(cat /shared/initial-master)
           echo "Initial master: $INITIAL_MASTER"
+          
+          if [ -f /shared/initial-replicas ]; then
+            echo "Initial replicas:"
+            cat /shared/initial-replicas
+          fi
           
           # Start HAProxy
           haproxy -f /usr/local/etc/haproxy/haproxy.cfg &
@@ -88,13 +122,30 @@ spec:
           # Wait for socket
           sleep 2
           
-          # Add initial master and enable it
-          echo "add server redis_backend/redis-master $INITIAL_MASTER check" | socat - /var/run/haproxy.sock
-          sleep 1
-          echo "enable server redis_backend/redis-master" | socat - /var/run/haproxy.sock
-          echo "set server redis_backend/redis-master state ready" | socat - /var/run/haproxy.sock
+          # === ADD MASTER TO MASTER_BACKEND ===
+          echo "add server master_backend/redis-master $INITIAL_MASTER check" | socat - /var/run/haproxy.sock
+          sleep 0.5
+          echo "set server master_backend/redis-master state ready" | socat - /var/run/haproxy.sock
+          echo "enable server master_backend/redis-master" | socat - /var/run/haproxy.sock
+          echo "✓ Master backend configured: $INITIAL_MASTER"
           
-          echo "HAProxy started with initial master (enabled)"
+          # === ADD REPLICAS TO REPLICA_BACKEND ===
+          if [ -f /shared/initial-replicas ]; then
+            IDX=1
+            while IFS= read -r replica; do
+              echo "add server replica_backend/replica-$IDX $replica check" | socat - /var/run/haproxy.sock
+              sleep 0.3
+              echo "set server replica_backend/replica-$IDX state ready" | socat - /var/run/haproxy.sock
+              echo "enable server replica_backend/replica-$IDX" | socat - /var/run/haproxy.sock
+              echo "✓ Replica backend configured: replica-$IDX = $replica"
+              IDX=$((IDX + 1))
+            done < /shared/initial-replicas
+          fi
+          
+          echo ""
+          echo "HAProxy started with dual backends:"
+          echo "  - Write port 6379 → master_backend (1 server)"
+          echo "  - Read port 6380 → replica_backend (2 servers)"
           
           # Keep running
           wait $HAPROXY_PID

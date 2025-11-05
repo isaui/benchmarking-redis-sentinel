@@ -1,81 +1,118 @@
-# Redis Sentinel Benchmark Script
-# Usage: .\run-benchmark.ps1
+# Redis Sentinel Dual-Backend Benchmark Script
+# Tests write (master) and read (replicas) separately
 
 $NAMESPACE = "redis-sentinel"
-$JOB_NAME = "redis-benchmark"
+$WRITE_JOB = "redis-benchmark-write"
+$READ_JOB = "redis-benchmark-read"
 
-Write-Host "================================" -ForegroundColor Cyan
-Write-Host "Redis Sentinel Benchmark Test" -ForegroundColor Cyan
-Write-Host "================================" -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host "Redis Sentinel Dual-Backend Benchmark" -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
-# Check if Redis is ready
-Write-Host "Checking Redis cluster status..." -ForegroundColor Yellow
-$redisStatus = kubectl get pods -n $NAMESPACE -l app=redis -o json | ConvertFrom-Json
-$readyPods = ($redisStatus.items | Where-Object { $_.status.phase -eq "Running" }).Count
+# Check if cluster is ready
+Write-Host "Checking cluster status..." -ForegroundColor Yellow
+$pods = kubectl get pods -n $NAMESPACE --no-headers 2>$null
 
-if ($readyPods -lt 3) {
-    Write-Host "ERROR: Redis cluster not ready ($readyPods/3 pods running)" -ForegroundColor Red
+$redisReady = ($pods | Select-String "redis-" | Select-String "Running").Count
+$haproxyReady = ($pods | Select-String "haproxy" | Select-String "2/2.*Running").Count
+
+if ($redisReady -lt 3) {
+    Write-Host "ERROR: Redis cluster not ready ($redisReady/3 pods)" -ForegroundColor Red
     exit 1
 }
 
-Write-Host "Redis cluster ready: $readyPods/3 pods running" -ForegroundColor Green
+if ($haproxyReady -lt 1) {
+    Write-Host "ERROR: HAProxy not ready" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "[OK] Redis cluster ready: $redisReady/3 pods" -ForegroundColor Green
+Write-Host "[OK] HAProxy ready with dual backends" -ForegroundColor Green
 Write-Host ""
 
-# Delete existing benchmark job if any
+# Clean up previous jobs
 Write-Host "Cleaning up previous benchmark jobs..." -ForegroundColor Yellow
-kubectl delete job $JOB_NAME -n $NAMESPACE --ignore-not-found=true | Out-Null
+kubectl delete job $WRITE_JOB $READ_JOB -n $NAMESPACE --ignore-not-found=true | Out-Null
 Start-Sleep -Seconds 2
 
-# Deploy benchmark job
-Write-Host "Starting benchmark job (4 pods, 2 threads, 10 connections each)..." -ForegroundColor Yellow
-kubectl apply -f 06-benchmark-job.yaml
-
 Write-Host ""
-Write-Host "Waiting for benchmark pods to start..." -ForegroundColor Yellow
+Write-Host "=== PHASE 1: Write Benchmark (Data Population) ===" -ForegroundColor Cyan
+Write-Host "Target: redis-ha:6379 (Master backend)" -ForegroundColor Gray
+Write-Host "Operation: 100% SET" -ForegroundColor Gray
+Write-Host "Pods: 4 pods x 2 threads x 10 conns = 80 concurrent writes" -ForegroundColor Gray
+Write-Host "Duration: 2 minutes" -ForegroundColor Gray
+Write-Host ""
+
+kubectl apply -f 06a-benchmark-write-job.yaml
+
+Write-Host "Monitoring write benchmark..." -ForegroundColor Yellow
 Start-Sleep -Seconds 5
 
-# Watch job progress
-Write-Host ""
-Write-Host "Benchmark Configuration:" -ForegroundColor Cyan
-Write-Host "  - Pods: 4 (parallel)" -ForegroundColor Gray
-Write-Host "  - Threads per pod: 2" -ForegroundColor Gray
-Write-Host "  - Connections per thread: 10" -ForegroundColor Gray
-Write-Host "  - Total connections: 80 (4 pods x 2 threads x 10 conns)" -ForegroundColor Gray
-Write-Host "  - Test duration: 2 minutes (120 seconds)" -ForegroundColor Gray
-Write-Host "  - Ratio: 50% SET, 50% GET (1:1)" -ForegroundColor Gray
-Write-Host "  - Data size: 256 bytes" -ForegroundColor Gray
-Write-Host ""
-
-Write-Host "Monitoring benchmark progress..." -ForegroundColor Yellow
-Write-Host "Press Ctrl+C to stop monitoring (job will continue running)" -ForegroundColor Gray
-Write-Host ""
-
-# Monitor job status
 $startTime = Get-Date
 while ($true) {
-    $job = kubectl get job $JOB_NAME -n $NAMESPACE -o json 2>$null | ConvertFrom-Json
+    $writeJob = kubectl get job $WRITE_JOB -n $NAMESPACE -o json 2>$null | ConvertFrom-Json
     
-    if ($job) {
-        $active = if ($job.status.active) { $job.status.active } else { 0 }
-        $succeeded = if ($job.status.succeeded) { $job.status.succeeded } else { 0 }
-        $failed = if ($job.status.failed) { $job.status.failed } else { 0 }
+    if ($writeJob) {
+        $active = if ($writeJob.status.active) { $writeJob.status.active } else { 0 }
+        $succeeded = if ($writeJob.status.succeeded) { $writeJob.status.succeeded } else { 0 }
+        $failed = if ($writeJob.status.failed) { $writeJob.status.failed } else { 0 }
         
         $elapsed = [math]::Round(((Get-Date) - $startTime).TotalSeconds, 0)
         
-        Write-Host "`r[${elapsed}s] Running: $active | Completed: $succeeded/4 | Failed: $failed" -NoNewline
+        Write-Host "`r[${elapsed}s] Write pods - Running: $active | Completed: $succeeded/4 | Failed: $failed" -NoNewline
         
         if ($succeeded -eq 4) {
             Write-Host ""
-            Write-Host ""
-            Write-Host "Benchmark completed successfully!" -ForegroundColor Green
+            Write-Host "[OK] Write benchmark completed!" -ForegroundColor Green
             break
         }
         
         if ($failed -gt 0) {
             Write-Host ""
+            Write-Host "[ERROR] Write benchmark failed!" -ForegroundColor Red
+            exit 1
+        }
+    }
+    
+    Start-Sleep -Seconds 2
+}
+
+Write-Host ""
+Write-Host "=== PHASE 2: Read Benchmark (Replica Performance) ===" -ForegroundColor Cyan
+Write-Host "Target: redis-ha:6380 (Replica backend - 2 replicas)" -ForegroundColor Gray
+Write-Host "Operation: 100% GET" -ForegroundColor Gray
+Write-Host "Pods: 4 pods x 2 threads x 10 conns = 80 concurrent reads" -ForegroundColor Gray
+Write-Host "Duration: 2 minutes" -ForegroundColor Gray
+Write-Host ""
+
+kubectl apply -f 06b-benchmark-read-job.yaml
+
+Write-Host "Monitoring read benchmark..." -ForegroundColor Yellow
+Start-Sleep -Seconds 5
+
+$startTime = Get-Date
+while ($true) {
+    $readJob = kubectl get job $READ_JOB -n $NAMESPACE -o json 2>$null | ConvertFrom-Json
+    
+    if ($readJob) {
+        $active = if ($readJob.status.active) { $readJob.status.active } else { 0 }
+        $succeeded = if ($readJob.status.succeeded) { $readJob.status.succeeded } else { 0 }
+        $failed = if ($readJob.status.failed) { $readJob.status.failed } else { 0 }
+        
+        $elapsed = [math]::Round(((Get-Date) - $startTime).TotalSeconds, 0)
+        
+        Write-Host "`r[${elapsed}s] Read pods - Running: $active | Completed: $succeeded/4 | Failed: $failed" -NoNewline
+        
+        if ($succeeded -eq 4) {
             Write-Host ""
-            Write-Host "WARNING: Some pods failed!" -ForegroundColor Red
+            Write-Host "[OK] Read benchmark completed!" -ForegroundColor Green
+            break
+        }
+        
+        if ($failed -gt 0) {
+            Write-Host ""
+            Write-Host "[ERROR] Read benchmark failed!" -ForegroundColor Red
             break
         }
     }
@@ -84,42 +121,14 @@ while ($true) {
 }
 
 Write-Host ""
-Write-Host "================================" -ForegroundColor Cyan
-Write-Host "Benchmark Results" -ForegroundColor Cyan
-Write-Host "================================" -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Green
+Write-Host "BENCHMARK COMPLETED!" -ForegroundColor Green
+Write-Host "============================================" -ForegroundColor Green
 Write-Host ""
-
-# Get pod names
-$pods = kubectl get pods -n $NAMESPACE -l app=redis-benchmark -o json | ConvertFrom-Json
-
-Write-Host "Collecting results from $($pods.items.Count) pods..." -ForegroundColor Yellow
+Write-Host "View results:" -ForegroundColor Cyan
+Write-Host "  kubectl logs -l tier=write -n $NAMESPACE" -ForegroundColor White
+Write-Host "  kubectl logs -l tier=read -n $NAMESPACE" -ForegroundColor White
 Write-Host ""
-
-foreach ($pod in $pods.items) {
-    $podName = $pod.metadata.name
-    Write-Host "=== Results from $podName ===" -ForegroundColor Cyan
-    
-    # Get logs from completed pod
-    $logs = kubectl logs $podName -n $NAMESPACE 2>$null
-    
-    if ($logs) {
-        # Extract summary lines
-        $logs | Select-String -Pattern "Totals|Type|GET|SET|Ops/sec|Hits/sec|Latency" | ForEach-Object {
-            Write-Host $_.Line -ForegroundColor Gray
-        }
-    } else {
-        Write-Host "No logs available" -ForegroundColor Red
-    }
-    
-    Write-Host ""
-}
-
-Write-Host ""
-Write-Host "Benchmark Summary Commands:" -ForegroundColor Cyan
-Write-Host "  kubectl logs -l app=redis-benchmark -n $NAMESPACE --tail=50" -ForegroundColor Gray
-Write-Host "  kubectl get job $JOB_NAME -n $NAMESPACE" -ForegroundColor Gray
-Write-Host ""
-
-Write-Host "To delete benchmark job:" -ForegroundColor Cyan
-Write-Host "  kubectl delete job $JOB_NAME -n $NAMESPACE" -ForegroundColor Gray
+Write-Host "Cleanup:" -ForegroundColor Cyan
+Write-Host "  kubectl delete job $WRITE_JOB $READ_JOB -n $NAMESPACE" -ForegroundColor White
 Write-Host ""

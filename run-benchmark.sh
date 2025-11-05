@@ -1,83 +1,117 @@
 #!/bin/bash
 
-# Redis Sentinel Benchmark Script
-# Usage: ./run-benchmark.sh
+# Redis Sentinel Dual-Backend Benchmark Script
+# Tests write (master) and read (replicas) separately
 
 set -e
 
 NAMESPACE="redis-sentinel"
-JOB_NAME="redis-benchmark"
+WRITE_JOB="redis-benchmark-write"
+READ_JOB="redis-benchmark-read"
 
-echo "================================"
-echo "Redis Sentinel Benchmark Test"
-echo "================================"
+echo "============================================"
+echo "Redis Sentinel Dual-Backend Benchmark"
+echo "============================================"
 echo ""
 
-# Check if Redis is ready
-echo "⏳ Checking Redis cluster status..."
-READY_PODS=$(kubectl get pods -n $NAMESPACE -l app=redis --no-headers 2>/dev/null | grep "Running" | wc -l)
+# Check if cluster is ready
+echo "⏳ Checking cluster status..."
+REDIS_READY=$(kubectl get pods -n $NAMESPACE -l app=redis --no-headers 2>/dev/null | grep "Running" | wc -l)
+HAPROXY_READY=$(kubectl get pods -n $NAMESPACE -l app=haproxy --no-headers 2>/dev/null | grep "2/2.*Running" | wc -l)
 
-if [ $READY_PODS -lt 3 ]; then
-    echo "❌ ERROR: Redis cluster not ready ($READY_PODS/3 pods running)"
+if [ $REDIS_READY -lt 3 ]; then
+    echo "[ERROR] Redis cluster not ready ($REDIS_READY/3 pods)"
     exit 1
 fi
 
-echo "✅ Redis cluster ready: $READY_PODS/3 pods running"
+if [ $HAPROXY_READY -lt 1 ]; then
+    echo "[ERROR] HAProxy not ready"
+    exit 1
+fi
+
+echo "[OK] Redis cluster ready: $REDIS_READY/3 pods"
+echo "[OK] HAProxy ready with dual backends"
 echo ""
 
-# Delete existing benchmark job if any
+# Delete existing benchmark jobs
 echo "🧹 Cleaning up previous benchmark jobs..."
-kubectl delete job $JOB_NAME -n $NAMESPACE --ignore-not-found=true >/dev/null 2>&1
+kubectl delete job $WRITE_JOB $READ_JOB -n $NAMESPACE --ignore-not-found=true >/dev/null 2>&1
 sleep 2
 
-# Deploy benchmark job
-echo "🚀 Starting benchmark job (4 pods, 2 threads, 10 connections each)..."
-kubectl apply -f 06-benchmark-job.yaml
-
 echo ""
-echo "⏳ Waiting for benchmark pods to start..."
+echo "=== PHASE 1: Write Benchmark (Data Population) ==="
+echo "Target: redis-ha:6379 (Master backend)"
+echo "Operation: 100% SET"
+echo "Pods: 4 pods x 2 threads x 10 conns = 80 concurrent writes"
+echo "Duration: 2 minutes"
+echo ""
+
+kubectl apply -f 06a-benchmark-write-job.yaml
+
+echo "📈 Monitoring write benchmark..."
 sleep 5
 
-# Show configuration
-echo ""
-echo "📊 Benchmark Configuration:"
-echo "  - Pods: 4 (parallel)"
-echo "  - Threads per pod: 2"
-echo "  - Connections per thread: 10"
-echo "  - Total connections: 80 (4 pods x 2 threads x 10 conns)"
-echo "  - Test duration: 2 minutes (120 seconds)"
-echo "  - Ratio: 50% SET, 50% GET (1:1)"
-echo "  - Data size: 256 bytes"
-echo ""
-
-echo "📈 Monitoring benchmark progress..."
-echo "Press Ctrl+C to stop monitoring (job will continue running)"
-echo ""
-
-# Monitor job status
 START_TIME=$(date +%s)
 while true; do
-    JOB_STATUS=$(kubectl get job $JOB_NAME -n $NAMESPACE -o json 2>/dev/null || echo "{}")
+    WRITE_STATUS=$(kubectl get job $WRITE_JOB -n $NAMESPACE -o json 2>/dev/null || echo "{}")
     
-    ACTIVE=$(echo $JOB_STATUS | jq -r '.status.active // 0')
-    SUCCEEDED=$(echo $JOB_STATUS | jq -r '.status.succeeded // 0')
-    FAILED=$(echo $JOB_STATUS | jq -r '.status.failed // 0')
+    ACTIVE=$(echo $WRITE_STATUS | jq -r '.status.active // 0')
+    SUCCEEDED=$(echo $WRITE_STATUS | jq -r '.status.succeeded // 0')
+    FAILED=$(echo $WRITE_STATUS | jq -r '.status.failed // 0')
     
     ELAPSED=$(($(date +%s) - START_TIME))
     
-    printf "\r[${ELAPSED}s] Running: $ACTIVE | Completed: $SUCCEEDED/4 | Failed: $FAILED"
+    printf "\r[${ELAPSED}s] Write pods - Running: $ACTIVE | Completed: $SUCCEEDED/4 | Failed: $FAILED"
     
     if [ "$SUCCEEDED" -eq 4 ]; then
         echo ""
-        echo ""
-        echo "✅ Benchmark completed successfully!"
+        echo "[OK] Write benchmark completed!"
         break
     fi
     
     if [ "$FAILED" -gt 0 ]; then
         echo ""
+        echo "[ERROR] Write benchmark failed!"
+        exit 1
+    fi
+    
+    sleep 2
+done
+
+echo ""
+echo "=== PHASE 2: Read Benchmark (Replica Performance) ==="
+echo "Target: redis-ha:6380 (Replica backend - 2 replicas)"
+echo "Operation: 100% GET"
+echo "Pods: 4 pods x 2 threads x 10 conns = 80 concurrent reads"
+echo "Duration: 2 minutes"
+echo ""
+
+kubectl apply -f 06b-benchmark-read-job.yaml
+
+echo "📈 Monitoring read benchmark..."
+sleep 5
+
+START_TIME=$(date +%s)
+while true; do
+    READ_STATUS=$(kubectl get job $READ_JOB -n $NAMESPACE -o json 2>/dev/null || echo "{}")
+    
+    ACTIVE=$(echo $READ_STATUS | jq -r '.status.active // 0')
+    SUCCEEDED=$(echo $READ_STATUS | jq -r '.status.succeeded // 0')
+    FAILED=$(echo $READ_STATUS | jq -r '.status.failed // 0')
+    
+    ELAPSED=$(($(date +%s) - START_TIME))
+    
+    printf "\r[${ELAPSED}s] Read pods - Running: $ACTIVE | Completed: $SUCCEEDED/4 | Failed: $FAILED"
+    
+    if [ "$SUCCEEDED" -eq 4 ]; then
         echo ""
-        echo "⚠️  WARNING: Some pods failed!"
+        echo "[OK] Read benchmark completed!"
+        break
+    fi
+    
+    if [ "$FAILED" -gt 0 ]; then
+        echo ""
+        echo "[ERROR] Read benchmark failed!"
         break
     fi
     
@@ -85,32 +119,14 @@ while true; do
 done
 
 echo ""
-echo "================================"
-echo "📊 Benchmark Results"
-echo "================================"
+echo "============================================"
+echo "[OK] BENCHMARK COMPLETED!"
+echo "============================================"
 echo ""
-
-# Get pod names
-PODS=$(kubectl get pods -n $NAMESPACE -l app=redis-benchmark -o json | jq -r '.items[].metadata.name')
-
-echo "📥 Collecting results from pods..."
+echo "View results:"
+echo "  kubectl logs -l tier=write -n $NAMESPACE"
+echo "  kubectl logs -l tier=read -n $NAMESPACE"
 echo ""
-
-for POD in $PODS; do
-    echo "=== Results from $POD ==="
-    
-    # Get logs from completed pod
-    kubectl logs $POD -n $NAMESPACE 2>/dev/null | grep -E "Totals|Type|GET|SET|Ops/sec|Hits/sec|Latency" || echo "No logs available"
-    
-    echo ""
-done
-
-echo ""
-echo "📋 Benchmark Summary Commands:"
-echo "  kubectl logs -l app=redis-benchmark -n $NAMESPACE --tail=50"
-echo "  kubectl get job $JOB_NAME -n $NAMESPACE"
-echo ""
-
-echo "🗑️  To delete benchmark job:"
-echo "  kubectl delete job $JOB_NAME -n $NAMESPACE"
+echo "Cleanup:"
+echo "  kubectl delete job $WRITE_JOB $READ_JOB -n $NAMESPACE"
 echo ""
