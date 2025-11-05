@@ -157,14 +157,19 @@ data:
                 /^flags$/ { getline; flags=$0; if (flags !~ /s_down/) print ip":"port }
             ')
             
-            # Resolve hostnames to IPs
+            # Resolve hostnames to IPs and deduplicate
             NEW_REPLICAS=""
+            SEEN_IPS=""
             for replica in $REPLICA_LIST; do
                 REPLICA_HOST=$(echo "$replica" | cut -d: -f1)
                 REPLICA_PORT=$(echo "$replica" | cut -d: -f2)
                 REPLICA_IP=$(resolve_ip "$REPLICA_HOST")
                 if [ -n "$REPLICA_IP" ] && [ -n "$REPLICA_PORT" ]; then
-                    NEW_REPLICAS="$NEW_REPLICAS $REPLICA_IP:$REPLICA_PORT"
+                    # Skip if IP already seen
+                    if ! echo "$SEEN_IPS" | grep -q "$REPLICA_IP"; then
+                        NEW_REPLICAS="$NEW_REPLICAS $REPLICA_IP:$REPLICA_PORT"
+                        SEEN_IPS="$SEEN_IPS $REPLICA_IP"
+                    fi
                 fi
             done
             
