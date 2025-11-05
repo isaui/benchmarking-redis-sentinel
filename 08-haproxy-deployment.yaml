@@ -1,0 +1,157 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: haproxy
+  namespace: redis-sentinel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: haproxy
+  template:
+    metadata:
+      labels:
+        app: haproxy
+    spec:
+      initContainers:
+      # Init master dari Sentinel sebelum HAProxy start
+      - name: init-master
+        image: redis:7.2-alpine
+        command:
+        - sh
+        - -c
+        - |
+          echo "Discovering initial master from Sentinel..."
+          
+          # Wait for Sentinel
+          until redis-cli -h sentinel.redis-sentinel.svc.cluster.local -p 26379 PING; do
+            echo "Waiting for Sentinel..."
+            sleep 2
+          done
+          
+          # Get master
+          MASTER_INFO=$(redis-cli -h sentinel.redis-sentinel.svc.cluster.local -p 26379 \
+            SENTINEL get-master-addr-by-name mymaster)
+          
+          MASTER_HOST=$(echo "$MASTER_INFO" | head -n1)
+          MASTER_PORT=$(echo "$MASTER_INFO" | tail -n1)
+          
+          # Resolve hostname to IP if needed
+          if echo "$MASTER_HOST" | grep -q "\."; then
+            # It's a hostname, resolve to IP
+            MASTER_IP=$(getent hosts $MASTER_HOST | awk '{ print $1 }' | head -n1)
+            if [ -z "$MASTER_IP" ]; then
+              # Fallback: use nslookup
+              MASTER_IP=$(nslookup $MASTER_HOST | grep "Address:" | tail -n1 | awk '{print $2}')
+            fi
+          else
+            # Already an IP
+            MASTER_IP=$MASTER_HOST
+          fi
+          
+          echo "Master: $MASTER_HOST -> $MASTER_IP:$MASTER_PORT"
+          echo "$MASTER_IP:$MASTER_PORT" > /shared/initial-master
+      
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+          
+      containers:
+      # HAProxy container
+      - name: haproxy
+        image: haproxytech/haproxy-alpine:2.8
+        ports:
+        - containerPort: 6379
+          name: redis
+        - containerPort: 8404
+          name: stats
+        command:
+        - sh
+        - -c
+        - |
+          # Install socat for Runtime API
+          apk add --no-cache socat redis
+          
+          # Wait for initial master discovery
+          while [ ! -f /shared/initial-master ]; do
+            echo "Waiting for initial master..."
+            sleep 1
+          done
+          
+          INITIAL_MASTER=$(cat /shared/initial-master)
+          echo "Initial master: $INITIAL_MASTER"
+          
+          # Start HAProxy
+          haproxy -f /usr/local/etc/haproxy/haproxy.cfg &
+          HAPROXY_PID=$!
+          
+          # Wait for socket
+          sleep 2
+          
+          # Add initial master and enable it
+          echo "add server redis_backend/redis-master $INITIAL_MASTER check" | socat - /var/run/haproxy.sock
+          sleep 1
+          echo "enable server redis_backend/redis-master" | socat - /var/run/haproxy.sock
+          echo "set server redis_backend/redis-master state ready" | socat - /var/run/haproxy.sock
+          
+          echo "HAProxy started with initial master (enabled)"
+          
+          # Keep running
+          wait $HAPROXY_PID
+          
+        volumeMounts:
+        - name: config
+          mountPath: /usr/local/etc/haproxy
+        - name: socket
+          mountPath: /var/run
+        - name: shared
+          mountPath: /shared
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+            
+      # Sentinel watcher sidecar
+      - name: sentinel-watcher
+        image: redis:7.2-alpine
+        command:
+        - sh
+        - -c
+        - |
+          # Install socat for HAProxy Runtime API
+          apk add --no-cache socat
+          
+          # Run watcher script
+          sh /scripts/sentinel-watcher.sh
+        volumeMounts:
+        - name: config
+          mountPath: /scripts
+        - name: socket
+          mountPath: /var/run
+        - name: shared
+          mountPath: /shared
+        env:
+        - name: SENTINEL_HOST
+          value: "sentinel.redis-sentinel.svc.cluster.local"
+        - name: SENTINEL_PORT
+          value: "26379"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+            
+      volumes:
+      - name: config
+        configMap:
+          name: haproxy-config
+          defaultMode: 0755
+      - name: socket
+        emptyDir: {}
+      - name: shared
+        emptyDir: {}

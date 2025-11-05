@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-benchmark
+  namespace: redis-sentinel
+spec:
+  # 4 pods running in parallel
+  parallelism: 4
+  completions: 4
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: redis-benchmark
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: memtier
+        image: redislabs/memtier_benchmark:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Starting benchmark..."
+          echo "Pod: $HOSTNAME"
+          echo "Target: redis-ha.redis-sentinel.svc.cluster.local:6379 (via HAProxy)"
+          echo ""
+          echo "HAProxy provides:"
+          echo "  - Auto-discovery of current master via Sentinel"
+          echo "  - Automatic failover handling"
+          echo "  - Connection routing to active master"
+          echo ""
+          
+          # Wait for HAProxy to be ready
+          echo "Waiting for HAProxy..."
+          sleep 5
+          
+          # Run memtier_benchmark via HAProxy
+          memtier_benchmark \
+            --server=redis-ha.redis-sentinel.svc.cluster.local \
+            --port=6379 \
+            --protocol=redis \
+            --clients=10 \
+            --threads=2 \
+            --test-time=120 \
+            --ratio=1:1 \
+            --data-size=256 \
+            --key-pattern=S:S \
+            --pipeline=1 \
+            --randomize \
+            --distinct-client-seed \
+            --print-percentiles=50,90,95,99,99.9 \
+            --json-out-file=/tmp/benchmark-result.json
+          
+          echo ""
+          echo "Benchmark completed!"
+          echo "Results saved to /tmp/benchmark-result.json"
+          
+          # Print summary
+          cat /tmp/benchmark-result.json | grep -E '"Totals"|"GET"|"SET"' || true
+        resources:
+          requests:
+            cpu: 500m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi

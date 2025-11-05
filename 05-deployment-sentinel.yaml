@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel
+  namespace: redis-sentinel
+spec:
+  replicas: 3  # 3 Sentinel pods untuk quorum
+  selector:
+    matchLabels:
+      app: sentinel
+  template:
+    metadata:
+      labels:
+        app: sentinel
+    spec:
+      initContainers:
+      # Init container untuk setup sentinel config dengan POD_IP
+      - name: init-sentinel
+        image: redis:7.2-alpine
+        command:
+        - sh
+        - -c
+        - |
+          # Wait for Redis master to be ready
+          echo "Waiting for Redis master to be ready..."
+          for i in {1..30}; do
+            if nslookup redis-0.redis-headless >/dev/null 2>&1; then
+              echo "Redis master DNS resolved successfully!"
+              break
+            fi
+            echo "Attempt $i: Redis master not ready, waiting..."
+            sleep 2
+          done
+          
+          cp /tmp/sentinel/sentinel.conf /data/sentinel.conf
+          # Replace POD_IP placeholder dengan actual pod IP
+          sed -i 's|__POD_IP__|'"${POD_IP}"'|g' /data/sentinel.conf
+          cat /data/sentinel.conf
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        volumeMounts:
+        - name: sentinel-config
+          mountPath: /tmp/sentinel
+        - name: sentinel-data
+          mountPath: /data
+      containers:
+      - name: sentinel
+        image: redis:7.2-alpine
+        ports:
+        - containerPort: 26379
+          name: sentinel
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        command:
+        - redis-sentinel
+        - /data/sentinel.conf
+        volumeMounts:
+        - name: sentinel-data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        livenessProbe:
+          tcpSocket:
+            port: 26379
+          initialDelaySeconds: 20
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -p
+            - "26379"
+            - ping
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: sentinel-config
+        configMap:
+          name: sentinel-config
+      - name: sentinel-data
+        emptyDir: {}

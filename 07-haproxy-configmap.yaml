@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: haproxy-config
+  namespace: redis-sentinel
+data:
+  haproxy.cfg: |
+    global
+        log stdout format raw local0
+        maxconn 4096
+        stats socket /var/run/haproxy.sock mode 660 level admin expose-fd listeners
+        stats timeout 30s
+        
+    defaults
+        log global
+        mode tcp
+        option tcplog
+        timeout connect 5s
+        timeout client 30s
+        timeout server 30s
+        timeout check 2s
+        
+    # Frontend untuk client connections
+    frontend redis_frontend
+        bind *:6379
+        default_backend redis_backend
+        
+    # Backend - Redis master (dynamically updated via Runtime API)
+    backend redis_backend
+        mode tcp
+        option tcp-check
+        
+        # Health check to verify it's master
+        tcp-check connect
+        tcp-check send PING\r\n
+        tcp-check expect string +PONG
+        tcp-check send ROLE\r\n
+        tcp-check expect string master
+        tcp-check send QUIT\r\n
+        
+        # Dynamic server - will be added/updated by sentinel-watcher
+        # Initial placeholder
+        
+    # Admin/Stats page
+    frontend stats
+        bind *:8404
+        mode http
+        stats enable
+        stats uri /
+        stats refresh 5s
+        stats show-legends
+        stats admin if TRUE
+  
+  sentinel-watcher.sh: |
+    #!/bin/sh
+    # Sentinel watcher - monitors Sentinel and updates HAProxy via Runtime API
+    
+    SENTINEL_HOST="sentinel.redis-sentinel.svc.cluster.local"
+    SENTINEL_PORT="26379"
+    MASTER_NAME="mymaster"
+    HAPROXY_SOCKET="/var/run/haproxy.sock"
+    CHECK_INTERVAL=5
+    
+    echo "Starting Sentinel watcher..."
+    echo "Sentinel: $SENTINEL_HOST:$SENTINEL_PORT"
+    echo "Master name: $MASTER_NAME"
+    echo ""
+    
+    CURRENT_MASTER=""
+    
+    while true; do
+        # Query Sentinel for current master
+        MASTER_INFO=$(redis-cli -h $SENTINEL_HOST -p $SENTINEL_PORT \
+            SENTINEL get-master-addr-by-name $MASTER_NAME 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$MASTER_INFO" ]; then
+            MASTER_HOST=$(echo "$MASTER_INFO" | head -n1)
+            MASTER_PORT=$(echo "$MASTER_INFO" | tail -n1)
+            
+            # Resolve hostname to IP if needed
+            if echo "$MASTER_HOST" | grep -q "\."; then
+                # It's a hostname, resolve to IP
+                MASTER_IP=$(getent hosts $MASTER_HOST | awk '{ print $1 }' | head -n1)
+                if [ -z "$MASTER_IP" ]; then
+                    # Fallback: use nslookup
+                    MASTER_IP=$(nslookup $MASTER_HOST | grep "Address:" | tail -n1 | awk '{print $2}')
+                fi
+            else
+                # Already an IP
+                MASTER_IP=$MASTER_HOST
+            fi
+            
+            NEW_MASTER="${MASTER_IP}:${MASTER_PORT}"
+            
+            if [ "$NEW_MASTER" != "$CURRENT_MASTER" ] && [ -n "$MASTER_IP" ]; then
+                echo "[$(date)] Master changed: $CURRENT_MASTER -> $NEW_MASTER (from $MASTER_HOST)"
+                
+                # Remove old server if exists
+                if [ -n "$CURRENT_MASTER" ]; then
+                    echo "set server redis_backend/redis-master state maint" | socat - $HAPROXY_SOCKET
+                    sleep 0.5
+                    echo "del server redis_backend/redis-master" | socat - $HAPROXY_SOCKET
+                fi
+                
+                # Add new master with IP
+                echo "add server redis_backend/redis-master $MASTER_IP:$MASTER_PORT check" | socat - $HAPROXY_SOCKET
+                sleep 0.5
+                echo "set server redis_backend/redis-master state ready" | socat - $HAPROXY_SOCKET
+                echo "enable server redis_backend/redis-master" | socat - $HAPROXY_SOCKET
+                
+                # Verify
+                ROLE=$(redis-cli -h $MASTER_IP -p $MASTER_PORT ROLE 2>/dev/null | head -n1)
+                echo "[$(date)] New master $NEW_MASTER verified as: $ROLE"
+                
+                CURRENT_MASTER="$NEW_MASTER"
+            fi
+        else
+            echo "[$(date)] Failed to query Sentinel, retrying..."
+        fi
+        
+        sleep $CHECK_INTERVAL
+    done

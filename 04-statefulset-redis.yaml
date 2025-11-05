@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: redis-sentinel
+spec:
+  serviceName: redis-headless
+  replicas: 3  # 1 Master + 2 Replica
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      initContainers:
+      - name: init-redis
+        image: redis:7.2-alpine
+        command:
+        - sh
+        - -c
+        - |
+          cp /tmp/redis/redis.conf /data/redis.conf
+          sed -i 's|__POD_IP__|'"${POD_IP}"'|g' /data/redis.conf
+          cat /data/redis.conf
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        volumeMounts:
+        - name: redis-config
+          mountPath: /tmp/redis
+        - name: redis-data
+          mountPath: /data
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        command:
+        - sh
+        - -c
+        - |
+          # Tentukan role: redis-0 = master, sisanya = replica
+          if [ "$(hostname)" = "redis-0" ]; then
+            echo "Starting as MASTER"
+            redis-server /data/redis.conf
+          else
+            echo "Starting as REPLICA of redis-0"
+            redis-server /data/redis.conf --replicaof redis-0.redis-headless.redis-sentinel.svc.cluster.local 6379
+          fi
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: redis-config
+        configMap:
+          name: redis-config
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi

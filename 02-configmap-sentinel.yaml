@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-config
+  namespace: redis-sentinel
+data:
+  sentinel.conf: |
+    # Sentinel configuration
+    bind 0.0.0.0
+    port 26379
+    
+    # Enable hostname resolution (Redis 6.2+)
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    
+    # Monitor redis master
+    # sentinel monitor <master-name> <ip> <port> <quorum>
+    # Monitor specific master pod - Best practice for Sentinel
+    sentinel monitor mymaster redis-0.redis-headless 6379 2
+    
+    # Timeout untuk detect master down (5 detik)
+    sentinel down-after-milliseconds mymaster 5000
+    
+    # Timeout untuk failover (3 menit)
+    sentinel failover-timeout mymaster 180000
+    
+    # Parallel sync (1 replica at a time)
+    sentinel parallel-syncs mymaster 1
+    
+    # Sentinel announce (untuk client discovery)
+    sentinel announce-ip __POD_IP__
+    sentinel announce-port 26379
+    
+    # Logging
+    loglevel notice
+    
+    # Security
+    protected-mode no

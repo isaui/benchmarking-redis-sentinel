@@ -1,0 +1,67 @@
+---
+# Headless Service untuk StatefulSet Redis (internal DNS)
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: redis-sentinel
+spec:
+  clusterIP: None  # Headless
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+    name: redis
+
+---
+# Service untuk akses Redis via load balancer
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: redis-sentinel
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+    name: redis
+
+---
+# Service untuk Sentinel (client discovery)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel
+  namespace: redis-sentinel
+  labels:
+    app: sentinel
+spec:
+  type: ClusterIP
+  selector:
+    app: sentinel
+  ports:
+  - port: 26379
+    targetPort: 26379
+    name: sentinel
+
+---
+# Headless Service untuk Sentinel (optional, untuk discovery)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-headless
+  namespace: redis-sentinel
+spec:
+  clusterIP: None
+  selector:
+    app: sentinel
+  ports:
+  - port: 26379
+    targetPort: 26379
+    name: sentinel
